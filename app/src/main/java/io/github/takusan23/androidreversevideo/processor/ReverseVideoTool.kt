@@ -29,11 +29,6 @@ object ReverseVideoTool {
 
         // Canvas で逆から書く
         val paint = Paint()
-        val textPaint = Paint().apply {
-            style = Paint.Style.FILL
-            color = Color.WHITE
-            textSize = 50f
-        }
         CanvasVideoProcessor.start(
             outFile = reverseVideoFile,
             bitRate = bitRate,
@@ -41,16 +36,15 @@ object ReverseVideoTool {
             outputVideoWidth = videoWidth,
             outputVideoHeight = videoHeight,
             onCanvasDrawRequest = { currentPositionMs ->
+                println(currentPositionMs)
                 // ここが Canvas なので、好きなように書く
                 // 逆再生したときの、動画のフレームを取り出して、Canvas に書く。
                 // getFrameAtTime はマイクロ秒なので注意
                 val reverseCurrentPositionMs = durationMs - currentPositionMs
                 val bitmap = inputVideoMediaMetadataRetriever.getFrameAtTime(reverseCurrentPositionMs * 1_000, MediaMetadataRetriever.OPTION_CLOSEST)
-                drawColor(Color.BLACK)
                 if (bitmap != null) {
                     drawBitmap(bitmap, 0f, 0f, paint)
                 }
-                drawText(currentPositionMs.toString(), 100f, 100f, textPaint)
                 currentPositionMs <= durationMs
             }
         )
