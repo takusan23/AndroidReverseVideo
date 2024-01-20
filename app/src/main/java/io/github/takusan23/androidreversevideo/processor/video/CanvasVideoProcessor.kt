@@ -8,9 +8,13 @@ import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.media.MediaMuxer
 import android.net.Uri
+import kotlinx.coroutines.DelicateCoroutinesApi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.newSingleThreadContext
 import kotlinx.coroutines.withContext
 import java.io.File
 
@@ -18,6 +22,10 @@ object CanvasVideoProcessor {
 
     /** タイムアウト */
     private const val TIMEOUT_US = 10000L
+
+    /** OpenGL 描画用スレッドの Kotlin Coroutine Dispatcher */
+    @OptIn(DelicateCoroutinesApi::class)
+    private val openGlRelatedThreadDispatcher = newSingleThreadContext("openGlRelatedThreadDispatcher")
 
     /**
      * 処理を開始する
@@ -29,7 +37,7 @@ object CanvasVideoProcessor {
      * @param frameRate フレームレート
      * @param outputVideoWidth 動画の高さ
      * @param outputVideoHeight 動画の幅
-     * @param onCanvasDrawRequest Canvasの描画が必要になったら呼び出される。trueを返している間、動画を作成する
+     * @param onCanvasDrawRequest Canvasの描画が必要になったら呼び出される。1フレームごとに呼ばれます（60fpsの場合は60回呼ばれる）。trueを返している間、動画を作成する
      */
     suspend fun start(
         outFile: File,
@@ -53,79 +61,105 @@ object CanvasVideoProcessor {
             configure(videoMediaFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
         }
 
-        // エンコーダーのSurfaceを取得して、OpenGLを利用してCanvasを重ねます
-        val canvasInputSurface = CanvasInputSurface(
-            encodeMediaCodec.createInputSurface(),
-            TextureRenderer(
-                outputVideoWidth = outputVideoWidth,
-                outputVideoHeight = outputVideoHeight
-            )
-        )
-        // OpenGL
-        canvasInputSurface.makeCurrent()
-        encodeMediaCodec.start()
-        canvasInputSurface.createRender()
+        // OpenGL の初期化をする。OpenGL 関連の関数を呼び出す場合は、OpenGL 用に用意したスレッドに切り替えてから
+        val canvasInputSurface = withContext(openGlRelatedThreadDispatcher) {
+            // エンコーダーのSurfaceを取得して、OpenGLを利用してCanvasを重ねます
+            CanvasInputSurface(
+                encodeMediaCodec.createInputSurface(),
+                TextureRenderer(
+                    outputVideoWidth = outputVideoWidth,
+                    outputVideoHeight = outputVideoHeight
+                )
+            ).apply {
+                makeCurrent()
+                // エンコーダー開始
+                encodeMediaCodec.start()
+                createRender()
+            }
+        }
 
         // マルチプレクサ
         var videoTrackIndex = -1
         val mediaMuxer = MediaMuxer(outFile.path, containerFormat)
 
-        // メタデータ格納用
-        val bufferInfo = MediaCodec.BufferInfo()
+        // 終了フラグ
         var outputDone = false
-        val startMs = System.currentTimeMillis()
 
-        try {
-            while (!outputDone) {
+        // OpenGL の描画用メインループ。
+        // 先述の通り、OpenGL はスレッドでコンテキストを識別するため、OpenGL 用スレッドに切り替える必要あり。
+        val openGlRenderingJob = launch(openGlRelatedThreadDispatcher) {
+            // 1フレームの時間
+            // 60fps なら 16ms、30fps なら 33ms
+            val frameMs = 1_000 / frameRate
+            // 経過時間。マイクロ秒
+            var currentPositionUs = 0L
+            try {
+                while (!outputDone) {
+                    // コルーチンキャンセル時は強制終了
+                    if (!isActive) break
 
-                // コルーチンキャンセル時は強制終了
-                if (!isActive) break
-
-                // Surface経由でデータを貰って保存する
-                val encoderStatus = encodeMediaCodec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
-                if (encoderStatus >= 0) {
-                    val encodedData = encodeMediaCodec.getOutputBuffer(encoderStatus)!!
-                    if (bufferInfo.size > 1) {
-                        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
-                            // MediaMuxer へ addTrack した後
-                            mediaMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
-                        }
+                    // OpenGL で描画する
+                    // Canvas の入力をする
+                    var isRunning = false
+                    canvasInputSurface.drawCanvas { canvas ->
+                        isRunning = onCanvasDrawRequest(canvas, currentPositionUs / 1_000L)
                     }
-                    encodeMediaCodec.releaseOutputBuffer(encoderStatus, false)
-                } else if (encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-                    // MediaMuxerへ映像トラックを追加するのはこのタイミングで行う
-                    // このタイミングでやると固有のパラメーターがセットされたMediaFormatが手に入る(csd-0 とか)
-                    // 映像がぶっ壊れている場合（緑で塗りつぶされてるとか）は多分このあたりが怪しい
-                    val newFormat = encodeMediaCodec.outputFormat
-                    videoTrackIndex = mediaMuxer.addTrack(newFormat)
-                    mediaMuxer.start()
+                    canvasInputSurface.setPresentationTime(currentPositionUs * 1_000L)
+                    canvasInputSurface.swapBuffers()
+                    if (!isRunning) {
+                        outputDone = true
+                        encodeMediaCodec.signalEndOfInputStream()
+                    }
+                    // 時間を増やす
+                    // 1 フレーム分の時間。ミリ秒なので増やす
+                    currentPositionUs += frameMs * 1_000L
                 }
-                if (encoderStatus != MediaCodec.INFO_TRY_AGAIN_LATER) {
-                    continue
-                }
-                // OpenGLで描画する
-                // Canvas の入力をする
-                val presentationTimeUs = (System.currentTimeMillis() - startMs) * 1000
-                var isRunning = false
-                canvasInputSurface.drawCanvas { canvas ->
-                    isRunning = onCanvasDrawRequest(canvas, presentationTimeUs / 1000L)
-                }
-                canvasInputSurface.setPresentationTime(presentationTimeUs * 1000)
-                canvasInputSurface.swapBuffers()
-                if (!isRunning) {
-                    outputDone = true
-                    encodeMediaCodec.signalEndOfInputStream()
-                }
+            } finally {
+                // リソース開放
+                canvasInputSurface.release()
             }
-        } finally {
-            // OpenGL開放
-            canvasInputSurface.release()
-            // エンコーダー終了
-            encodeMediaCodec.stop()
-            encodeMediaCodec.release()
-            // MediaMuxerも終了
-            mediaMuxer.stop()
-            mediaMuxer.release()
         }
+
+        // エンコーダーのループ
+        val encoderJob = launch {
+            // メタデータ
+            val bufferInfo = MediaCodec.BufferInfo()
+            try {
+                while (!outputDone) {
+                    // コルーチンキャンセル時は強制終了
+                    if (!isActive) break
+
+                    // Surface経由でデータを貰って保存する
+                    val encoderStatus = encodeMediaCodec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
+                    if (encoderStatus >= 0) {
+                        // MediaMuxer へ addTrack した後
+                        val encodedData = encodeMediaCodec.getOutputBuffer(encoderStatus)!!
+                        mediaMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                        encodeMediaCodec.releaseOutputBuffer(encoderStatus, false)
+                    } else if (encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                        // MediaMuxerへ映像トラックを追加するのはこのタイミングで行う
+                        // このタイミングでやると固有のパラメーターがセットされたMediaFormatが手に入る(csd-0 とか)
+                        // 映像がぶっ壊れている場合（緑で塗りつぶされてるとか）は多分このあたりが怪しい
+                        val newFormat = encodeMediaCodec.outputFormat
+                        videoTrackIndex = mediaMuxer.addTrack(newFormat)
+                        mediaMuxer.start()
+                    }
+                    if (encoderStatus != MediaCodec.INFO_TRY_AGAIN_LATER) {
+                        continue
+                    }
+                }
+            } finally {
+                // エンコーダー終了
+                encodeMediaCodec.stop()
+                encodeMediaCodec.release()
+                // MediaMuxerも終了
+                mediaMuxer.stop()
+                mediaMuxer.release()
+            }
+        }
+
+        // それぞれのメインループが終わるまで、コルーチンを一時停止
+        openGlRenderingJob.join()
+        encoderJob.join()
     }
 }
