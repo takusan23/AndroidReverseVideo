@@ -2,6 +2,7 @@ package io.github.takusan23.androidreversevideo
 
 import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -63,6 +64,8 @@ fun HomeScreen() {
         val uri = selectVideoUri.value ?: return
         scope.launch {
             ReverseVideoTool.start(context, uri)
+            Toast.makeText(context, "変換が完了しました", Toast.LENGTH_SHORT).show()
+            println("変換が完了しました")
         }
     }
 

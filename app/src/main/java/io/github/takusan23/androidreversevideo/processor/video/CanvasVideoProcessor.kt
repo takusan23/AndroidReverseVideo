@@ -132,9 +132,13 @@ object CanvasVideoProcessor {
                     // Surface経由でデータを貰って保存する
                     val encoderStatus = encodeMediaCodec.dequeueOutputBuffer(bufferInfo, TIMEOUT_US)
                     if (encoderStatus >= 0) {
-                        // MediaMuxer へ addTrack した後
-                        val encodedData = encodeMediaCodec.getOutputBuffer(encoderStatus)!!
-                        mediaMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                        if (bufferInfo.size > 0) {
+                            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG == 0) {
+                                // MediaMuxer へ addTrack した後
+                                val encodedData = encodeMediaCodec.getOutputBuffer(encoderStatus)!!
+                                mediaMuxer.writeSampleData(videoTrackIndex, encodedData, bufferInfo)
+                            }
+                        }
                         encodeMediaCodec.releaseOutputBuffer(encoderStatus, false)
                     } else if (encoderStatus == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
                         // MediaMuxerへ映像トラックを追加するのはこのタイミングで行う
